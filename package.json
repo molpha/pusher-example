@@ -1,0 +1,31 @@
+{
+  "name": "molpha-pusher",
+  "version": "0.1.0",
+  "description": "High-frequency push-feed demo on Molpha: threshold-signed price updates at 4 Hz per feed, submitted to Solana in order, plus a consumer-side watcher that measures what lands on-chain.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "info": "tsx src/cli.ts info",
+    "probe": "tsx src/cli.ts probe",
+    "push": "tsx src/cli.ts push",
+    "watch": "tsx src/cli.ts watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@anchor-lang/core": "^1.1.2",
+    "@molpha/sdk": "0.2.0",
+    "bn.js": "^5.2.2",
+    "dotenv": "^18.0.8"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

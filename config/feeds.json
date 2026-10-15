@@ -1,0 +1,51 @@
+{
+  "$comment": "Five price feeds at 4 updates/s each. Every feed is identified on-chain by sourceId = keccak256(canonical apiConfig), so changing a URL, parser or aggregation policy creates a new feed. Run `npm run probe` after any edit: it checks that the nodes can fetch and agree on every source before you spend quota on a long run.",
+  "defaults": {
+    "intervalMs": 250,
+    "signaturesRequired": 3,
+    "aggregation": {
+      "mode": "tolerance",
+      "rule": "median",
+      "maxDeviationBps": 25,
+      "maxAgeMs": 1000,
+      "numeric": { "type": "int256", "decimals": 8 }
+    }
+  },
+  "feeds": [
+    {
+      "label": "SOL/USD",
+      "apiConfig": {
+        "url": "https://api.exchange.coinbase.com/products/SOL-USD/ticker",
+        "responseParser": "$.price"
+      }
+    },
+    {
+      "label": "BTC/USD",
+      "apiConfig": {
+        "url": "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+        "responseParser": "$.price"
+      }
+    },
+    {
+      "label": "ETH/USD",
+      "apiConfig": {
+        "url": "https://api.exchange.coinbase.com/products/ETH-USD/ticker",
+        "responseParser": "$.price"
+      }
+    },
+    {
+      "label": "SUI/USD",
+      "apiConfig": {
+        "url": "https://api.exchange.coinbase.com/products/SUI-USD/ticker",
+        "responseParser": "$.price"
+      }
+    },
+    {
+      "label": "HYPE/USDT",
+      "apiConfig": {
+        "url": "https://api.bybit.com/v5/market/tickers?category=spot&symbol=HYPEUSDT",
+        "responseParser": "$.result.list[0].lastPrice"
+      }
+    }
+  ]
+}
