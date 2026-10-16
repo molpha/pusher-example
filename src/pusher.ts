@@ -7,9 +7,28 @@ import {
   type MolphaSDK,
   type RoundContext,
 } from "@molpha/sdk";
-import type { FeedSpec } from "./config.js";
+import type { Commitment, FeedSpec } from "./config.js";
 import { SubmitQueue, type Item, type QueueOptions } from "./queue.js";
+import { sendWithoutConfirm } from "./sdk.js";
 import { Rate, Samples } from "./stats.js";
+
+/** How long a broadcast signature may stay unseen before it is treated as dropped. */
+const PROCESSED_TIMEOUT_MS = 4_000;
+/** How long to keep sampling a processed signature for the configured commitment. */
+const CONFIRM_TIMEOUT_MS = 20_000;
+const STATUS_POLL_MS = 200;
+
+const COMMITMENT_RANK: Record<Commitment, number> = { processed: 1, confirmed: 2, finalized: 3 };
+
+export interface SignatureStatus {
+  err: unknown;
+  confirmationStatus?: Commitment;
+}
+
+/** The slice of `Connection.getSignatureStatuses` the submit lane polls. */
+export interface SignatureStatusClient {
+  getSignatureStatuses(signatures: string[]): Promise<{ value: Array<SignatureStatus | null> }>;
+}
 
 export interface PusherOptions extends QueueOptions {
   /** Most gateway rounds of one feed in flight at once. */
@@ -24,6 +43,11 @@ export interface PusherOptions extends QueueOptions {
   noSubmit: boolean;
   /** Stop starting rounds once this many have been started across all feeds. */
   maxRounds?: number;
+  /**
+   * Commitment at which `confirmMs` and `onchainAgeMs` are recorded.
+   * The next transaction is sent when the previous signature is `processed`.
+   */
+  commitment?: Commitment;
 }
 
 /** Shared, periodically refreshed round context (registry version, selection inputs, nodes). */
@@ -90,21 +114,44 @@ export interface FeedStats {
   signedAgeMs: Samples;
   submit: { txOk: number; landed: number; staleRejected: number; failedTx: number; givenUp: number };
   submitErrors: Record<string, number>;
-  /** Send -> confirmed at the configured commitment, ms. */
+  /** Send -> the configured commitment, ms. Does not gate the next send. */
   confirmMs: Samples;
-  /** Gateway round timestamp -> confirmed on-chain, ms. The number Lavarage cares about. */
+  /** Gateway round timestamp -> the configured commitment, ms. The number Lavarage cares about. */
   onchainAgeMs: Samples;
   batchSize: Samples;
   landedRate: Rate;
   roundRate: Rate;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+function errText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
 
 function errName(err: unknown): string {
   if (err instanceof GatewayError) return `gateway ${err.status ?? "?"}`;
-  const msg = err instanceof Error ? err.message : String(err);
-  if (/FeedNotNewer|0x178e/i.test(msg)) return "FeedNotNewer";
+  const msg = errText(err);
+  if (/FeedNotNewer|0x178e|Error Number: 6030|"Custom":\s*6030/i.test(msg)) return "FeedNotNewer";
   if (/timeout|timed out|abort/i.test(msg)) return "timeout";
   if (/block ?height exceeded|expired/i.test(msg)) return "blockhash expired";
   if (/registry/i.test(msg)) return "registry";
@@ -116,10 +163,16 @@ function bump(map: Record<string, number>, key: string): void {
   map[key] = (map[key] ?? 0) + 1;
 }
 
+function reached(status: Commitment | undefined, target: Commitment): boolean {
+  return status !== undefined && COMMITMENT_RANK[status] >= COMMITMENT_RANK[target];
+}
+
 /**
  * Drives one feed: starts a gateway round every `intervalMs`, queues the signed
  * attestations by timestamp, and submits them to Solana one transaction at a time
- * (adaptive batches, oldest first).
+ * (adaptive batches, oldest first). The next transaction is sent when the previous
+ * signature is processed. Confirmation at {@link PusherOptions.commitment} is recorded
+ * in the background and does not hold the lane.
  */
 export class FeedPusher {
   readonly stats: FeedStats;
@@ -131,6 +184,8 @@ export class FeedPusher {
   private submitLoopDone?: Promise<void>;
   private timer?: NodeJS.Timeout;
   private readonly pendingRounds = new Set<Promise<void>>();
+  private readonly pendingConfirms = new Set<Promise<void>>();
+  private readonly confirmAbort = new AbortController();
 
   constructor(
     readonly feed: FeedSpec,
@@ -138,7 +193,9 @@ export class FeedPusher {
     private readonly ctx: ContextCache,
     private readonly budget: RoundBudget,
     private readonly opts: PusherOptions,
+    private readonly statuses?: SignatureStatusClient,
   ) {
+    sendWithoutConfirm(sdk);
     this.queue = new SubmitQueue<Attestation>(opts);
     this.stats = {
       label: feed.label,
@@ -199,6 +256,8 @@ export class FeedPusher {
     await Promise.race([Promise.allSettled([...this.pendingRounds]), sleep(drainMs)]);
     this.wake?.();
     if (this.submitLoopDone) await Promise.race([this.submitLoopDone, sleep(drainMs)]);
+    this.confirmAbort.abort();
+    await Promise.allSettled([...this.pendingConfirms]);
   }
 
   private tick(): void {
@@ -265,42 +324,125 @@ export class FeedPusher {
   }
 
   private async submit(batch: Item<Attestation>[]): Promise<void> {
-    const t0 = Date.now();
+    const sentAt = Date.now();
+    let signature: string;
     try {
-      const attestations = batch.map((i) => i.value);
-      if (attestations.length === 1) {
-        await this.sdk.solana.submitAttestation(attestations[0]!, {
-          priorityFeeMicroLamports: this.opts.priorityFee,
-        });
-      } else {
-        await this.sdk.solana.submitAttestations(attestations, {
-          priorityFeeMicroLamports: this.opts.priorityFee,
-        });
-      }
-      this.onLanded(batch, t0);
+      signature = await this.broadcast(batch);
     } catch (err) {
-      const cause = err;
-      if (cause instanceof BatchTooLargeError) {
-        this.maxBatch = Math.max(1, cause.fits);
-        this.queue.requeue(batch, Number.POSITIVE_INFINITY);
+      await this.onBroadcastError(batch, err, sentAt);
+      return;
+    }
+    // One execution deep: the account is free once the signature is processed.
+    // Confirmation at the configured commitment does not hold the next batch.
+    const status = await this.pollStatus(signature, "processed", PROCESSED_TIMEOUT_MS);
+    if (status === "timeout") {
+      if (await this.landedAnyway(batch)) {
+        this.markExecuted(batch);
+        this.watchConfirmed(signature, batch, sentAt);
         return;
       }
-      const name = errName(cause);
+      this.stats.submit.failedTx++;
+      bump(this.stats.submitErrors, "timeout");
+      this.stats.submit.givenUp += this.queue.requeue(batch, this.opts.maxSubmitAttempts);
+      return;
+    }
+    if (status.err) {
+      const name = errName(status.err);
       bump(this.stats.submitErrors, name);
       if (name === "FeedNotNewer") {
         this.stats.submit.staleRejected += batch.length;
         this.queue.rejectedStale(batch);
         return;
       }
-      // A confirmation timeout does not mean the transaction failed: check the
-      // feed before resending, or a landed batch would be resent and refused.
       if (await this.landedAnyway(batch)) {
-        this.onLanded(batch, t0);
+        this.markExecuted(batch);
+        this.watchConfirmed(signature, batch, sentAt);
         return;
       }
       this.stats.submit.failedTx++;
       this.stats.submit.givenUp += this.queue.requeue(batch, this.opts.maxSubmitAttempts);
+      return;
     }
+    this.markExecuted(batch);
+    const commitment = this.opts.commitment ?? "confirmed";
+    if (reached(status.confirmationStatus, commitment)) this.markConfirmed(batch, sentAt);
+    else this.watchConfirmed(signature, batch, sentAt);
+  }
+
+  private async broadcast(batch: Item<Attestation>[]): Promise<string> {
+    const attestations = batch.map((i) => i.value);
+    const priorityFeeMicroLamports = this.opts.priorityFee;
+    const result =
+      attestations.length === 1
+        ? await this.sdk.solana.submitAttestation(attestations[0]!, { priorityFeeMicroLamports })
+        : await this.sdk.solana.submitAttestations(attestations, { priorityFeeMicroLamports });
+    return result.signature;
+  }
+
+  private async onBroadcastError(batch: Item<Attestation>[], err: unknown, sentAt: number): Promise<void> {
+    if (err instanceof BatchTooLargeError) {
+      this.maxBatch = Math.max(1, err.fits);
+      this.queue.requeue(batch, Number.POSITIVE_INFINITY);
+      return;
+    }
+    const name = errName(err);
+    bump(this.stats.submitErrors, name);
+    if (name === "FeedNotNewer") {
+      this.stats.submit.staleRejected += batch.length;
+      this.queue.rejectedStale(batch);
+      return;
+    }
+    // A dropped send can still have landed. Check the feed before resending.
+    if (await this.landedAnyway(batch)) {
+      this.markExecuted(batch);
+      this.markConfirmed(batch, sentAt);
+      return;
+    }
+    this.stats.submit.failedTx++;
+    this.stats.submit.givenUp += this.queue.requeue(batch, this.opts.maxSubmitAttempts);
+  }
+
+  private async pollStatus(
+    signature: string,
+    target: Commitment,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<SignatureStatus | "timeout"> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) return "timeout";
+      try {
+        const status = await this.readStatus(signature);
+        if (status?.err) return status;
+        if (status && reached(status.confirmationStatus, target)) return status;
+      } catch {
+        // A status RPC blip is not a failed transaction. Poll until the deadline.
+      }
+      await sleep(STATUS_POLL_MS, signal);
+    }
+    return "timeout";
+  }
+
+  private async readStatus(signature: string): Promise<SignatureStatus | null> {
+    if (!this.statuses) return null;
+    const { value } = await this.statuses.getSignatureStatuses([signature]);
+    return value[0] ?? null;
+  }
+
+  /** Record confirmation latency without holding the submit lane. */
+  private watchConfirmed(signature: string, batch: Item<Attestation>[], sentAt: number): void {
+    const target = this.opts.commitment ?? "confirmed";
+    if (target === "processed") {
+      this.markConfirmed(batch, sentAt);
+      return;
+    }
+    const job = this.pollStatus(signature, target, CONFIRM_TIMEOUT_MS, this.confirmAbort.signal).then(
+      (status) => {
+        if (status !== "timeout" && !status.err) this.markConfirmed(batch, sentAt);
+      },
+    );
+    this.pendingConfirms.add(job);
+    void job.finally(() => this.pendingConfirms.delete(job));
   }
 
   private async landedAnyway(batch: Item<Attestation>[]): Promise<boolean> {
@@ -317,14 +459,20 @@ export class FeedPusher {
     }
   }
 
-  private onLanded(batch: Item<Attestation>[], sentAt: number): void {
+  /** The signature is processed: the feed account has moved, so the next batch may be sent. */
+  private markExecuted(batch: Item<Attestation>[]): void {
     const now = Date.now();
     this.queue.landedBatch(batch);
     this.stats.submit.txOk++;
     this.stats.submit.landed += batch.length;
     this.stats.batchSize.add(batch.length);
-    this.stats.confirmMs.add(now - sentAt);
     this.stats.landedRate.hit(now, batch.length);
+  }
+
+  /** The signature reached the configured commitment. */
+  private markConfirmed(batch: Item<Attestation>[], sentAt: number): void {
+    const now = Date.now();
+    this.stats.confirmMs.add(now - sentAt);
     for (const i of batch) this.stats.onchainAgeMs.add(now - i.ts);
   }
 }

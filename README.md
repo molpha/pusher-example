@@ -33,16 +33,16 @@ stamps each round on a 100 ms grid, so one feed can run up to 10 rounds per seco
 (`FeedNotNewer`). Separate transactions sent 250 ms apart often reach the leader out of
 order: the SDK docs report about a third at that spacing in a devnet run. So the pusher:
 
-- keeps **one transaction in flight per feed**;
-- queues rounds that finish while it confirms, sorted by round timestamp;
+- keeps **one transaction in flight per feed** until that signature is `processed`;
+- records confirmation at `COMMITMENT` in the background, so the vote does not hold the next send;
+- queues rounds that finish while that signature is in flight, sorted by round timestamp;
 - sends the queue as **one transaction with several `submit_attestation` instructions**,
   applied oldest first and atomically (`submitAttestations`).
 
-The batch size adapts to confirmation latency. With confirms around 500 ms at 4 Hz, a
-transaction carries about two updates, so 5 feeds cost about 10 tx/s rather than 20. A
+The batch size adapts to how long the previous transaction takes to be processed. A
 round that finishes after a newer one has already been sent can never land, and is dropped
-and counted as `late`. A confirmation timeout is checked against the feed account before
-anything is resent.
+and counted as `late`. A signature that never reaches `processed` is checked against the
+feed account before anything is resent.
 
 **Modes.**
 
@@ -102,10 +102,10 @@ Both commands write a JSON report to `reports/` on exit (Ctrl-C or `--duration`)
 |---|---|
 | `rnd/s` | Signed rounds per second (10 s window). |
 | `round p50/p95` | Request → signed attestation at the pusher, ms. |
-| `landed/s` | Updates confirmed on-chain per second. |
+| `landed/s` | Updates processed on-chain per second. The next send proceeds at this point. |
 | `batch` | Mean updates per transaction. |
-| `confirm p50/p95` | Transaction send → confirmed at `COMMITMENT`, ms. |
-| `age@chain p50/p95` | Round timestamp → confirmed on-chain, ms. How old a price is when a reader can first see it. |
+| `confirm p50/p95` | Transaction send → `COMMITMENT`, ms. This does not hold the next send. |
+| `age@chain p50/p95` | Round timestamp → `COMMITMENT`, ms. How old a price is when a reader at that commitment can first see it. |
 | `lost` | Updates signed but never landed: `late` + `expired` + over-backlog + given up + stale. Broken down in the report. |
 
 **`watch` dashboard**

@@ -213,6 +213,7 @@ async function push(argv: string[]) {
     priorityFee: env.priorityFee,
     noSubmit: values["no-submit"],
     maxRounds: values["max-rounds"] ? Number(values["max-rounds"]) : undefined,
+    commitment: env.commitment,
   };
   const durationMs = Number(values.duration) * 1000;
 
@@ -222,7 +223,7 @@ async function push(argv: string[]) {
   await ctx.get(); // fail fast on a bad RPC, program or gateway before the clock starts
   const balanceBefore = await connection.getBalance(payer);
 
-  const pushers = feeds.map((f) => new FeedPusher(f, sdk, ctx, budget, opts));
+  const pushers = feeds.map((f) => new FeedPusher(f, sdk, ctx, budget, opts, connection));
   const startedAt = Date.now() + 200;
   // Stagger feeds across one interval so their rounds do not all hit the gateway in the same tick.
   pushers.forEach((p, i) =>
