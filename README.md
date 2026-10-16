@@ -53,7 +53,8 @@ feed account before anything is resent.
 
 ## Quick start
 
-Requires Node.js ≥ 20.19 and a Solana devnet keypair with some SOL.
+Requires Node.js ≥ 20.19, the [Solana CLI](https://solana.com/docs/intro/installation), and a
+devnet wallet with SOL (transaction fees) and USDC (Molpha subscription).
 
 ```bash
 git clone <this repo> && cd molpha-pusher
@@ -61,31 +62,52 @@ npm install
 cp .env.example .env            # set RPC_URL and KEYPAIR_PATH
 ```
 
-**1. Subscription.** Rounds are paid from a Molpha subscription (USDC on Solana). Test USDC
-on devnet comes from [faucet.circle.com](https://faucet.circle.com/). Subscribe once with
-the SDK, as in its [quick start](https://github.com/Molpha/sdk#quick-start), or use the
-keypair of a delegate on an existing subscription.
+### Wallet (devnet)
 
-**2. Check the setup.**
+Generate a dedicated keypair (or reuse an existing one) and point the pusher at it:
+
+```bash
+solana-keygen new -o ~/.config/solpha/pusher.json
+# set KEYPAIR_PATH=~/.config/solpha/pusher.json in .env
+
+solana config set --url devnet
+solana address -k ~/.config/solpha/pusher.json   # pubkey for faucets
+```
+
+Fund it:
+
+1. **SOL** — pay submit fees and account rent. Request devnet SOL to the pubkey above, for
+   example `solana airdrop 2 $(solana address -k ~/.config/solpha/pusher.json) --url devnet`
+   (repeat if the faucet rate-limits you), or use the [Solana devnet faucet](https://faucet.solana.com/).
+2. **USDC** — pay for Molpha rounds. Request test USDC on **Solana Devnet** from
+   [Circle's faucet](https://faucet.circle.com/) to the same pubkey (6 decimals; the Basic plan
+   price is on the order of 1 USDC per term).
+
+The pusher wallet is also the on-chain **submitter** for every feed in `config/feeds.json`.
+To run rounds against someone else's subscription instead, use a **delegate** keypair and
+subscribe or extend from the owner wallet first (see the [SDK quick start](https://github.com/Molpha/sdk#quick-start));
+`probe` and `push` only auto-subscribe when this keypair has no subscription account of its own.
+
+**Check the setup.**
 
 ```bash
 npm run info     # payer, subscription and quota, registry, feed addresses, burn rate
-npm run probe    # one signed round per feed, no submit: are the sources reachable and agreed on?
+npm run probe    # subscribe if needed, then one signed round per feed (no submit)
 ```
 
-**3. Measure the signing path only.** Spends rounds, no SOL:
+**Measure the signing path only.** Spends rounds, no SOL:
 
 ```bash
 npm run push -- --no-submit --duration 60
 ```
 
-**4. Push.**
+**Push** (also ensures a subscription before the run):
 
 ```bash
 npm run push -- --duration 300 --max-rounds 6000
 ```
 
-**5. Watch from the consumer side.** Run this in another terminal or on another machine.
+**Watch from the consumer side.** Run this in another terminal or on another machine.
 It needs only an RPC endpoint, no subscription:
 
 ```bash

@@ -12,7 +12,7 @@ import {
 import { loadEnv, loadFeeds, type FeedSpec } from "./config.js";
 import { ContextCache, FeedPusher, RoundBudget, type PusherOptions } from "./pusher.js";
 import { pushReport, renderPush, renderWatch, watchReport } from "./report.js";
-import { createMolpha } from "./sdk.js";
+import { createMolpha, ensureSubscription } from "./sdk.js";
 import { startWatch } from "./watch.js";
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
@@ -103,7 +103,10 @@ async function info() {
   const sub = await sdk.solana.readSubscription();
   const roundsPerSecond = feeds.reduce((n, f) => n + 1000 / f.intervalMs, 0);
   if (!sub) {
-    console.log("subscription    none — subscribe first (see README) or use a delegate keypair");
+    console.log(
+      "subscription    none — `npm run probe` or `push` will subscribe on Basic (needs USDC), " +
+        "or use a delegate keypair (see README)",
+    );
   } else {
     const plan = await sdk.solana.readPlan(sub.planType);
     const validUntil = new Date(Number(sub.validUntil) * 1000).toISOString();
@@ -146,7 +149,8 @@ async function info() {
 async function probe() {
   const env = loadEnv();
   const feeds = loadFeeds();
-  const { sdk } = createMolpha(env);
+  const { sdk, payer } = createMolpha(env);
+  await ensureSubscription(sdk, payer);
   console.log(`probing ${feeds.length} feeds via ${sdk.gateway.endpointUrls().join(", ")} (one round each, no submit)\n`);
   const context = await sdk.gateway.prepareContext();
   let failed = 0;
@@ -218,6 +222,7 @@ async function push(argv: string[]) {
   const durationMs = Number(values.duration) * 1000;
 
   const { sdk, connection, payer } = createMolpha(env);
+  await ensureSubscription(sdk, payer);
   const ctx = new ContextCache(sdk);
   const budget = new RoundBudget(opts.maxRounds);
   await ctx.get(); // fail fast on a bad RPC, program or gateway before the clock starts

@@ -1,5 +1,10 @@
 import { web3 } from "@anchor-lang/core";
-import { MolphaSDK, DEFAULT_GATEWAY_ENDPOINT, type GatewayEndpointInput } from "@molpha/sdk";
+import {
+  MolphaSDK,
+  PlanType,
+  DEFAULT_GATEWAY_ENDPOINT,
+  type GatewayEndpointInput,
+} from "@molpha/sdk";
 import { walletFromKeypairFile } from "@molpha/sdk/utils";
 import { expandHome, type Env } from "./config.js";
 
@@ -30,6 +35,27 @@ export interface Molpha {
   sdk: MolphaSDK;
   connection: web3.Connection;
   payer: web3.PublicKey;
+}
+
+/**
+ * Ensure the payer wallet has an active Molpha subscription before spending rounds.
+ * Subscribes to the Basic plan when no on-chain subscription account exists (debiting USDC).
+ */
+export async function ensureSubscription(sdk: MolphaSDK, payer: web3.PublicKey): Promise<void> {
+  const sub = await sdk.solana.readSubscription(payer);
+  if (sub) return;
+
+  const plan = await sdk.solana.getPlan(PlanType.Basic);
+  const priceUsdc = Number(plan.subscriptionPrice) / 1e6;
+  console.log(
+    `No Molpha subscription for ${payer.toBase58()}; subscribing to Basic (${priceUsdc} USDC)…`,
+  );
+  const { signature, pricePaid } = await sdk.solana.subscribe(PlanType.Basic, {
+    maxPriceUsdc: plan.subscriptionPrice,
+  });
+  console.log(
+    `Subscribed (${signature}); paid ${Number(pricePaid) / 1e6} USDC (${plan.maxRounds} rounds per term).`,
+  );
 }
 
 export function createMolpha(env: Env): Molpha {
